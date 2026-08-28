@@ -113,6 +113,42 @@
 //     timings being cross-checked against it — was the source of an
 //     apparent "self-inconsistent" 4.7s gap SA flagged in an earlier macOS
 //     report; the underlying per-run numbers were consistent all along.)
+//
+// ---------------------------------------------------------------------
+// Second round of PM+SA review, 2026-08-28 (systemic AC gap found across
+// ALL Phase 0 issues, not just this one — issue #1's AC was rewritten to
+// encode these two formally; re-pull via `gh issue view 1` if unsure):
+//
+//  7. "success" (qwen3_tts_synthesize returned a non-null pointer) is NOT
+//     evidence the output is correct — a broken config can produce fluent-
+//     length garbage, wrong-language output, or a truncated/looped passage
+//     while still returning a clean, non-null result (this fork's own git
+//     history has a real precedent: a broken Q4_K quantization conversion
+//     that exited 0 and produced a non-null "garbage" inference result).
+//     `evaluateOutputSanity` below is only the CHEAP, first tier of a
+//     three-tier validity gate; it cannot catch "fluent but wrong". The
+//     second tier is a host-side ASR round-trip (sherpa-onnx SenseVoice,
+//     reused as-is from issue #2 — see phase0/ipad-bench/scripts/
+//     check_asr_validity.py in the parent repo) computing CER against the
+//     known input text for the WAV saved on run 1 of each block; the third
+//     tier is a human actually listening to that same WAV. Per the AC: if
+//     ANY of the three tiers fails for a given backend's block, that
+//     backend's ENTIRE RTF/memory dataset is INVALID and must not be cited
+//     as acceptance evidence — this is a per-backend verdict, not per-run.
+//  8. Model LOAD time (mmap + engine init, i.e. `qwen3_tts_create`) must be
+//     measured separately from generation time. The user-facing "100 字 ≤
+//     2 分钟" commitment is actual wait time from button-press to hearing
+//     audio, which for a first-time-this-session synthesis includes model
+//     load — reporting generation-only would understate real user wait.
+//     `runBlock` below times `qwen3_tts_create` and records it as both a
+//     dedicated `model_loaded` event (written immediately, so it survives
+//     even if run 1 itself never completes) and as `RunMetrics.modelLoadMs`
+//     on run 1's own record (for convenient colocated reporting). The
+//     eventual report must present BOTH cold-path-total (modelLoadMs +
+//     run 1's wallClockMs — the real first-use wait) and warm-path-only
+//     (runs 2-5's wallClockMs, model already resident) side by side, and
+//     state explicitly which one the "≤2 min" pass/fail verdict is judged
+//     against.
 
 import Foundation
 #if canImport(Darwin)
@@ -216,6 +252,44 @@ struct RunMetrics: Codable {
     var thermalSamples: [ThermalSample] = []
 
     var samplingIntervalMs: Double
+
+    // --- Output sanity fields (PM review, 2026-08-28) ---------------------
+    // `success` above only ever meant "qwen3_tts_synthesize returned a
+    // non-null pointer" — it says nothing about whether the audio behind
+    // that pointer is actually usable speech. A model that emits 22s of
+    // noise, silence, or truncated garbage would still report a clean RTF
+    // and success=true with no other signal. These fields are cheap
+    // (single-pass array scans over already-in-memory float samples) sanity
+    // checks computed for EVERY run, not just the one that gets saved as a
+    // WAV, specifically so a report can't accidentally present "fast" as
+    // "usable" without evidence.
+    var nSamples: Int32?
+    var sampleRate: Int32?
+    var rmsAmplitude: Double?
+    var peakAmplitude: Double?
+    var clippedSampleFraction: Double?
+    var outputSanityPassed: Bool?
+    var outputSanityNotes: [String]?
+    /// Set only for the one run per block (run 1) whose audio is dumped to
+    /// a WAV file for a human (the PM) to actually listen to and confirm
+    /// it's intelligible Mandarin — see PM's 2026-08-28 review: RTF/memory
+    /// numbers are not evidence the approach is viable until someone has
+    /// heard the output. Writing this file happens strictly AFTER
+    /// wallClockMs above is already captured, so file I/O never contaminates
+    /// the timed measurement.
+    var savedWavPath: String?
+
+    /// Set only on run 1 of each block (see PM review, 2026-08-28, note 8 in
+    /// the file header): time spent in `qwen3_tts_create` (mmap + engine
+    /// init), measured immediately before this loop starts and BEFORE any
+    /// per-run timing below, so it never contaminates any run's own
+    /// `wallClockMs`. Also emitted redundantly as a standalone
+    /// `model_loaded` event (see `runBlock`) so the figure survives on disk
+    /// even if run 1 itself is jetsam-killed before `run_completed` is
+    /// written. Cold-path-total (the real first-use wait the "100 字 ≤ 2
+    /// 分钟" commitment is about) = this + run 1's own `wallClockMs`;
+    /// warm-path = runs 2-5's `wallClockMs` with the model already resident.
+    var modelLoadMs: Double?
 
     var success: Bool
     var errorMessage: String?
@@ -355,6 +429,127 @@ final class RunSampler {
     }
 }
 
+// MARK: - Output sanity checks & WAV dump (PM review, 2026-08-28)
+//
+// `qwen3_tts_synthesize` returning a non-null pointer only proves the call
+// didn't crash/error out — it says nothing about whether what's behind that
+// pointer is intelligible Mandarin speech, silence, noise, or a truncated
+// fragment. Issue #1 exists to answer "is this model USABLE on-device", not
+// "does this function return quickly", so every run gets a few cheap,
+// automatable checks on top of the timing/memory numbers, and the first run
+// of each block gets dumped to a WAV a human can actually listen to.
+
+/// Result of scanning one run's raw float32 samples. All three checks are
+/// single-pass, O(n) array scans over data that's already resident in
+/// memory (the `Qwen3TtsAudio` this harness already holds a pointer to) —
+/// negligible cost relative to a multi-second synthesis call.
+struct OutputSanityCheck {
+    let rms: Double
+    let peak: Double
+    let clippedFraction: Double
+    let passed: Bool
+    let notes: [String]
+}
+
+/// `expectedTextLength` is the benchmark text's character count (currently
+/// always ~100 Chinese characters — see `BenchmarkHarness.benchText`).
+/// Issue #1's AC (re-pulled 2026-08-28, per PM+SA joint review) specifies
+/// ~100 Chinese characters should land around 25-35s of audio, "明显偏离即
+/// 无效" (an obvious deviation is invalid) — the bounds below give that a
+/// generous buffer on both sides (not a strict spec, and deliberately
+/// looser than 25-35s itself) so this only fires on a GROSS failure
+/// (near-total silence, runaway/truncated generation), not on ordinary
+/// run-to-run variance. NOTE: this duration check is only tier (a) of a
+/// three-tier validity gate (see file header, note 7) — it cannot by
+/// itself catch "fluent-length but wrong" output (wrong language, wrong
+/// passage); that's what the ASR round-trip CER check (tier b, host-side,
+/// phase0/ipad-bench/scripts/check_asr_validity.py) and human listening
+/// (tier c) are for.
+func evaluateOutputSanity(
+    samples: UnsafeBufferPointer<Float>,
+    sampleRate: Int32,
+    audioDurationS: Double,
+    expectedTextLength: Int
+) -> OutputSanityCheck {
+    var notes: [String] = []
+
+    let minExpectedS = 15.0
+    let maxExpectedS = 45.0
+    if audioDurationS < minExpectedS || audioDurationS > maxExpectedS {
+        notes.append("audioDurationS=\(audioDurationS) outside expected [\(minExpectedS), \(maxExpectedS)]s for a ~\(expectedTextLength)-character Mandarin passage")
+    }
+
+    var sumSq: Double = 0
+    var peak: Double = 0
+    var clippedCount = 0
+    let clipThreshold: Float = 0.995
+    let n = samples.count
+    for v in samples {
+        let av = Double(abs(v))
+        sumSq += av * av
+        if av > peak { peak = av }
+        if abs(v) >= clipThreshold { clippedCount += 1 }
+    }
+    let rms = n > 0 ? (sumSq / Double(n)).squareRoot() : 0
+    let clippedFraction = n > 0 ? Double(clippedCount) / Double(n) : 0
+
+    let silenceRmsThreshold = 0.001 // roughly -60 dBFS
+    if rms < silenceRmsThreshold {
+        notes.append("rms=\(rms) at/below silence threshold \(silenceRmsThreshold) — output is likely silence, not speech")
+    }
+
+    let clippingFractionThreshold = 0.01 // >1% of samples pinned near full-scale
+    if clippedFraction > clippingFractionThreshold {
+        notes.append("clippedFraction=\(clippedFraction) exceeds \(clippingFractionThreshold) — output may be clipped/distorted")
+    }
+
+    return OutputSanityCheck(rms: rms, peak: peak, clippedFraction: clippedFraction, passed: notes.isEmpty, notes: notes)
+}
+
+/// Minimal, dependency-free 16-bit PCM mono WAV writer. This exists purely
+/// so the PM can listen to real on-device output and confirm the ~100
+/// Chinese characters were actually rendered as intelligible speech — it is
+/// evidence for a human ear, not part of the measurement, and (per the
+/// caller in `runBlock`) is only ever invoked AFTER `wallClockMs` has
+/// already been captured so this I/O never contaminates the timed run.
+func writeWav(samples: UnsafeBufferPointer<Float>, sampleRate: Int32, to url: URL) throws {
+    let n = samples.count
+    var pcm16 = [Int16](repeating: 0, count: n)
+    for i in 0..<n {
+        let clamped = max(-1.0, min(1.0, Double(samples[i])))
+        pcm16[i] = Int16(clamped * Double(Int16.max))
+    }
+
+    let dataSize = UInt32(n * MemoryLayout<Int16>.size)
+    let byteRate = UInt32(sampleRate) * UInt32(MemoryLayout<Int16>.size)
+    let blockAlign = UInt16(MemoryLayout<Int16>.size)
+
+    func le<T: FixedWidthInteger>(_ v: T) -> [UInt8] {
+        withUnsafeBytes(of: v.littleEndian) { Array($0) }
+    }
+
+    var header = Data()
+    header.append(contentsOf: Array("RIFF".utf8))
+    header.append(contentsOf: le(UInt32(36) + dataSize))
+    header.append(contentsOf: Array("WAVE".utf8))
+    header.append(contentsOf: Array("fmt ".utf8))
+    header.append(contentsOf: le(UInt32(16)))          // fmt chunk size
+    header.append(contentsOf: le(UInt16(1)))           // PCM
+    header.append(contentsOf: le(UInt16(1)))           // mono
+    header.append(contentsOf: le(UInt32(sampleRate)))
+    header.append(contentsOf: le(byteRate))
+    header.append(contentsOf: le(blockAlign))
+    header.append(contentsOf: le(UInt16(16)))          // bits per sample
+    header.append(contentsOf: Array("data".utf8))
+    header.append(contentsOf: le(dataSize))
+
+    var full = header
+    pcm16.withUnsafeBufferPointer { buf in
+        full.append(Data(buffer: buf))
+    }
+    try full.write(to: url, options: .atomic)
+}
+
 // MARK: - Benchmark driver
 
 enum BenchmarkHarness {
@@ -432,10 +627,31 @@ enum BenchmarkHarness {
         params.n_threads = nThreads
 
         let modelDirPath = modelDirURL.path
+        // Timed separately from every run below (PM review, 2026-08-28, note
+        // 8 in the file header): this is mmap + engine init, not generation.
+        // The "100 字 ≤ 2 分钟" user-facing commitment is actual wait time
+        // from button-press to hearing audio, which for a first-time-this-
+        // session synthesis includes this load time — folding it silently
+        // into run 1's own wallClockMs (or omitting it entirely, as before
+        // this review) would either double-count it into "generation" or
+        // drop it from the report altogether. Neither is acceptable, so it
+        // gets its own clock and its own field/event.
+        let modelLoadT0 = Date()
         guard let tts = modelDirPath.withCString({ qwen3_tts_create($0, nThreads) }) else {
             sink.writeEvent("fatal", ["message": "qwen3_tts_create failed for \(modelDirPath)"])
             return
         }
+        let modelLoadMs = Date().timeIntervalSince(modelLoadT0) * 1000
+        // Written immediately (not deferred to run 1's run_completed) so this
+        // figure is on disk even if run 1 itself is jetsam-killed before it
+        // finishes — see ResultSink's doc comment on why events are flushed
+        // per-write rather than batched.
+        sink.writeEvent("model_loaded", [
+            "backend": benchBackendLabel,
+            "entitlementVariant": benchEntitlementLabel,
+            "nThreads": nThreads,
+            "modelLoadMs": modelLoadMs,
+        ])
         defer { qwen3_tts_destroy(tts) }
 
         for i in 1...numRuns {
@@ -448,6 +664,13 @@ enum BenchmarkHarness {
                 samplingIntervalMs: samplingIntervalMs,
                 success: false
             )
+            if i == 1 {
+                // See file header note 8 / the `model_loaded` event above:
+                // colocating this on run 1's own record too (in addition to
+                // the standalone event) is purely for report convenience —
+                // the standalone event is the authoritative/robust copy.
+                metrics.modelLoadMs = modelLoadMs
+            }
             // Written BEFORE generation starts: if the process is
             // jetsam-killed mid-run, this is the last event on disk for
             // run i, with no matching run_completed — that absence is the
@@ -484,9 +707,51 @@ enum BenchmarkHarness {
             metrics.thermalSamples = samples
 
             if let audio = audio {
-                let audioDurationS = Double(audio.pointee.n_samples) / Double(audio.pointee.sample_rate)
+                let nSamples = audio.pointee.n_samples
+                let sampleRate = audio.pointee.sample_rate
+                let audioDurationS = Double(nSamples) / Double(sampleRate)
                 metrics.audioDurationS = audioDurationS
                 metrics.rtf = (elapsedMs / 1000.0) / audioDurationS
+                metrics.nSamples = nSamples
+                metrics.sampleRate = sampleRate
+
+                // Everything below reads the still-valid `audio.pointee.samples`
+                // buffer but happens AFTER wallClockMs was already captured
+                // above, so none of it — sanity scan or WAV write — can
+                // contaminate the timed measurement (PM requirement).
+                let samplesBuffer = UnsafeBufferPointer(start: audio.pointee.samples, count: Int(nSamples))
+                let sanity = evaluateOutputSanity(
+                    samples: samplesBuffer,
+                    sampleRate: sampleRate,
+                    audioDurationS: audioDurationS,
+                    expectedTextLength: benchText.count
+                )
+                metrics.rmsAmplitude = sanity.rms
+                metrics.peakAmplitude = sanity.peak
+                metrics.clippedSampleFraction = sanity.clippedFraction
+                metrics.outputSanityPassed = sanity.passed
+                metrics.outputSanityNotes = sanity.notes
+
+                // Only run 1 of each block gets saved as a WAV: enough for a
+                // human to confirm intelligibility without paying repeated
+                // disk I/O across all 5 runs (which would also risk
+                // polluting later runs' "before" memory/thermal baselines
+                // with this run's file-write activity).
+                if i == 1 {
+                    let wavURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+                        .appendingPathComponent("sample_\(benchBackendLabel)_\(benchEntitlementLabel).wav")
+                    do {
+                        try writeWav(samples: samplesBuffer, sampleRate: sampleRate, to: wavURL)
+                        metrics.savedWavPath = wavURL.path
+                    } catch {
+                        sink.writeEvent("wav_write_failed", [
+                            "runIndex": i,
+                            "path": wavURL.path,
+                            "error": String(describing: error),
+                        ])
+                    }
+                }
+
                 metrics.success = true
                 qwen3_tts_free_audio(audio)
             } else {
@@ -536,7 +801,16 @@ enum BenchmarkHarness {
             let sink = ResultSink(url: cooldownResultsFileURL)
             cooldownBeforeBlock(previousBackend: prev, nextBackend: next, sink: sink)
             sink.close()
-            return
+            // `run_bench.sh` launches this app via `devicectl device process
+            // launch --console`, which blocks until the process actually
+            // exits (confirmed via `devicectl ... launch --help`). This app
+            // never returns to a foreground UI state worth keeping alive —
+            // its only job per launch is "do the work, flush the JSONL,
+            // exit" — so without this call the host script would hang here
+            // forever waiting for a termination that never happens on its
+            // own (the SwiftUI WindowGroup keeps the process alive
+            // indefinitely otherwise).
+            exit(0)
         }
 
         let sink = ResultSink(url: resultsFileURL)
@@ -568,5 +842,9 @@ enum BenchmarkHarness {
 
         sink.writeEvent("session_completed", [:])
         sink.close()
+        // See the matching comment in the mode=="cooldown" branch above:
+        // `--console`-attached devicectl launches block until this process
+        // exits, and nothing else in this app ever terminates it.
+        exit(0)
     }
 }
