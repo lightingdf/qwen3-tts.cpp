@@ -1,0 +1,97 @@
+name: IPadBench
+options:
+  bundleIdPrefix: com.voiceeditor
+  deploymentTarget:
+    iOS: "17.0"
+  developmentLanguage: en
+
+# Shared across both entitlement-variant targets. See
+# ios-bench/BenchmarkHarness.swift's file header and
+# phase0/ipad-bench/README.md (parent repo) for why there are two targets
+# (build-time entitlement axis) instead of one, and why backend selection
+# is NOT a build-time axis here (it's runtime, via QWEN3_TTS_BACKEND, driven
+# by phase0/ipad-bench/scripts/run_bench.sh through `devicectl`).
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+    TARGETED_DEVICE_FAMILY: "2"          # iPad only — see issue #1's hard device constraint
+    SUPPORTED_PLATFORMS: iphoneos        # device only; the linked .a's are arm64 *device* slices,
+    SDKROOT: iphoneos                    # not simulator slices, even though both are arm64 on Apple Silicon
+    ONLY_ACTIVE_ARCH: NO
+    ARCHS: arm64
+    VALID_ARCHS: arm64
+    CODE_SIGN_STYLE: Automatic
+    DEVELOPMENT_TEAM: BV4J676H8B
+    HEADER_SEARCH_PATHS: "$(SRCROOT)/../src"
+    LIBRARY_SEARCH_PATHS:
+      - "$(SRCROOT)/../build-ios"
+      - "$(SRCROOT)/../ggml/build-ios/src"
+      - "$(SRCROOT)/../ggml/build-ios/src/ggml-metal"
+    # Order matters on some linkers; kept identical to the order verified
+    # working in the standalone `swiftc -emit-executable` link test.
+    OTHER_LDFLAGS:
+      - "-lqwen3tts_c_api"
+      - "-lqwen3_tts"
+      - "-laudio_tokenizer_decoder"
+      - "-ltts_transformer"
+      - "-ltext_tokenizer"
+      - "-laudio_tokenizer_encoder"
+      - "-lggml-base"
+      - "-lggml-cpu"
+      - "-lggml"
+      - "-lggml-metal"
+      - "-lobjc"
+      - "-lc++"
+
+targets:
+  IPadBenchBaseline:
+    type: application
+    platform: iOS
+    sources:
+      - path: BenchmarkHarness.swift
+      - path: App
+    settings:
+      base:
+        PRODUCT_NAME: IPadBenchBaseline
+        PRODUCT_BUNDLE_IDENTIFIER: com.voiceeditor.ipadbench
+        SWIFT_OBJC_BRIDGING_HEADER: "$(SRCROOT)/BenchmarkHarness-Bridging-Header.h"
+        CODE_SIGN_ENTITLEMENTS: "$(SRCROOT)/entitlements/Bench-Baseline.entitlements"
+    info:
+      path: Generated-Info-Baseline.plist
+      properties:
+        UILaunchScreen: {}
+        UIRequiredDeviceCapabilities: [arm64]
+
+  IPadBenchIncreasedMem:
+    type: application
+    platform: iOS
+    sources:
+      - path: BenchmarkHarness.swift
+      - path: App
+    settings:
+      base:
+        PRODUCT_NAME: IPadBenchIncreasedMem
+        PRODUCT_BUNDLE_IDENTIFIER: com.voiceeditor.ipadbench.increasedmem
+        SWIFT_OBJC_BRIDGING_HEADER: "$(SRCROOT)/BenchmarkHarness-Bridging-Header.h"
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) BENCH_INCREASED_MEMORY_LIMIT"
+        CODE_SIGN_ENTITLEMENTS: "$(SRCROOT)/entitlements/Bench-IncreasedMemoryLimit.entitlements"
+    info:
+      path: Generated-Info-IncreasedMem.plist
+      properties:
+        UILaunchScreen: {}
+        UIRequiredDeviceCapabilities: [arm64]
+
+schemes:
+  IPadBenchBaseline:
+    build:
+      targets:
+        IPadBenchBaseline: all
+    run:
+      config: Release
+  IPadBenchIncreasedMem:
+    build:
+      targets:
+        IPadBenchIncreasedMem: all
+    run:
+      config: Release
