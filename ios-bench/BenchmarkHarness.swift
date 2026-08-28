@@ -498,17 +498,47 @@ enum BenchmarkHarness {
         }
     }
 
+    static var cooldownResultsFileURL: URL {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("bench_cooldown.jsonl")
+    }
+
     /// Entry point — call this from the app target once wired up (e.g.
-    /// from `applicationDidFinishLaunching` or a SwiftUI `.task {}`). Runs
-    /// the full 5-run block for whichever backend `QWEN3_TTS_BACKEND` was
-    /// set to at THIS launch (see `benchBackendLabel` / file-level comment
-    /// above) — a single app build handles every backend. Does NOT attempt
-    /// to run more than one backend per process invocation: that was tried
-    /// and found to contaminate results (see file-level comment), so the
-    /// two backends' 5-run blocks are always separate `devicectl process
-    /// launch` invocations, with an operator-visible cooldown in between,
-    /// not two in-process loops here.
+    /// from `applicationDidFinishLaunching` or a SwiftUI `.task {}`).
+    ///
+    /// Dispatches on `QWEN3_TTS_BENCH_MODE` (default "run") so that the
+    /// *cooldown* step between two backends' blocks can also be driven
+    /// purely by separate `devicectl process launch` invocations with
+    /// different env vars — never by looping over both backends inside one
+    /// process (that was tried and found to contaminate results; see the
+    /// file-level comment). The intended host-side sequence for one
+    /// backend transition is three launches of this same app:
+    ///
+    ///   1. `-e '{"QWEN3_TTS_BACKEND":"auto"}'`
+    ///        -> mode=run (default): 5-run Metal/auto block
+    ///   2. `-e '{"QWEN3_TTS_BENCH_MODE":"cooldown",
+    ///           "QWEN3_TTS_BENCH_PREV_BACKEND":"auto",
+    ///           "QWEN3_TTS_BENCH_NEXT_BACKEND":"cpu"}'`
+    ///        -> waits for thermalState to return to nominal (or times out),
+    ///           records one CooldownRecord to bench_cooldown.jsonl, exits
+    ///   3. `-e '{"QWEN3_TTS_BACKEND":"cpu"}'`
+    ///        -> mode=run: 5-run CPU block
+    ///
+    /// See phase0/ipad-bench/scripts/run_bench.sh (parent repo) for the
+    /// actual host-side orchestration that issues these three launches.
     static func run() {
+        let env = ProcessInfo.processInfo.environment
+        let mode = (env["QWEN3_TTS_BENCH_MODE"] ?? "run").lowercased()
+
+        if mode == "cooldown" {
+            let prev = (env["QWEN3_TTS_BENCH_PREV_BACKEND"] ?? "unknown").lowercased()
+            let next = (env["QWEN3_TTS_BENCH_NEXT_BACKEND"] ?? "unknown").lowercased()
+            let sink = ResultSink(url: cooldownResultsFileURL)
+            cooldownBeforeBlock(previousBackend: prev, nextBackend: next, sink: sink)
+            sink.close()
+            return
+        }
+
         let sink = ResultSink(url: resultsFileURL)
         sink.writeEvent("session_started", [
             "backend": benchBackendLabel,
