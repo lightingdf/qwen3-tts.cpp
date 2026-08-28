@@ -184,6 +184,26 @@ if(WIN32)
     target_link_libraries(qwen3_tts PUBLIC psapi)
 endif()
 
+# Static library with C API (same source as qwen3tts_shared below, built as
+# a static archive too). Exists for embedders that can't/don't want to carry
+# a shared library/dylib around — e.g. an iOS app target linking everything
+# statically, such as VoiceEditor issue #1's on-device benchmark harness.
+add_library(qwen3tts_c_api STATIC
+    src/qwen3tts_c_api.cpp
+)
+target_include_directories(qwen3tts_c_api PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(qwen3tts_c_api PUBLIC
+    qwen3_tts
+)
+if(APPLE)
+    # See the identical note on qwen3tts_shared below: qwen3tts_c_api.cpp
+    # calls the Objective-C runtime directly without #import-ing anything
+    # that would otherwise pull libobjc in as a link dependency.
+    target_link_libraries(qwen3tts_c_api PRIVATE objc)
+endif()
+
 # Shared library with C API (for Nim FFI)
 add_library(qwen3tts_shared SHARED
     src/qwen3tts_c_api.cpp
@@ -255,7 +275,7 @@ target_link_libraries(test_decoder PRIVATE
 )
 
 # Install targets
-install(TARGETS text_tokenizer tts_transformer audio_tokenizer_encoder audio_tokenizer_decoder qwen3_tts qwen3tts_shared qwen3-tts-cli
+install(TARGETS text_tokenizer tts_transformer audio_tokenizer_encoder audio_tokenizer_decoder qwen3_tts qwen3tts_c_api qwen3tts_shared qwen3-tts-cli
     ARCHIVE DESTINATION lib
     LIBRARY DESTINATION lib
     RUNTIME DESTINATION bin
