@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Bench-Baseline.entitlements
+
+  Entitlement variant WITHOUT com.apple.developer.kernel.increased-memory-limit.
+  Attach this to the app target/scheme built with
+  SWIFT_ACTIVE_COMPILATION_CONDITIONS not containing BENCH_INCREASED_MEMORY_LIMIT,
+  so the compiled-in `benchEntitlementLabel` ("baseline") matches what was
+  actually signed. See BenchmarkHarness.swift's file-level comment.
+-->
+<plist version="1.0">
+<dict>
+</dict>
+</plist>

@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Bench-IncreasedMemoryLimit.entitlements
+
+  Entitlement variant WITH com.apple.developer.kernel.increased-memory-limit.
+  This is a restricted entitlement: the app's App ID must have the
+  corresponding capability enabled in the Apple Developer portal (or via
+  Xcode's Signing & Capabilities UI while signed into an account with
+  access) before a provisioning profile containing it can be generated.
+  This is expected to require the same Xcode-account sign-in that is
+  currently blocking on-device deployment (see PR description / issue
+  thread) — do not expect this entitlement to provision successfully until
+  that is resolved.
+
+  Attach this to the app target/scheme built with
+  SWIFT_ACTIVE_COMPILATION_CONDITIONS containing BENCH_INCREASED_MEMORY_LIMIT,
+  so the compiled-in `benchEntitlementLabel` ("increased-memory-limit")
+  matches what was actually signed. See BenchmarkHarness.swift's file-level
+  comment.
+-->
+<plist version="1.0">
+<dict>
+    <key>com.apple.developer.kernel.increased-memory-limit</key>
+    <true/>
+</dict>
+</plist>
