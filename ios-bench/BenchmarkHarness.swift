@@ -357,9 +357,42 @@ struct BatchItemMetrics: Codable {
     var outputSanityNotes: [String]?
     var savedWavPath: String?
 
+    // --- Thermal/memory instrumentation (added 2026-08-29, PM request) -----
+    // batch_tts mode previously recorded NO thermalState at all (only
+    // runBlock/issue #1's benchmark mode did, via RunMetrics above) even
+    // though the >=15-item session test that uses this mode is exactly the
+    // scenario where sustained-load thermal throttling is the leading
+    // hypothesis for the item-10 cliff seen in attempts 2/3 (item 10, same
+    // input text as item 0, went from 36s to 2482s+ without finishing).
+    // Reuses the same RunSampler used by runBlock, just wired in here too —
+    // it already runs on a background thread for the full duration of the
+    // (synchronous, blocking) qwen3_tts_synthesize call, so a long-running
+    // item like the item-10 cliff gets proportionally MORE samples, not
+    // fewer: this is what satisfies "long items must also be sampled
+    // mid-generation" without any special-casing by item length.
+    var thermalStateBefore: String?
+    var thermalStateAfter: String?
+    var thermalSamples: [ThermalSample] = []
+    /// Peak phys_footprint observed during this item's synthesize call
+    /// (same underlying sampler as thermalSamples, correlatable by
+    /// elapsedMs) — bonus field, effectively free from the same sampler,
+    /// kept so a memory-growth explanation and a thermal explanation for
+    /// the item-10 cliff can be told apart from the same run's data instead
+    /// of needing a second instrumented pass.
+    var physFootprintPeakBytes: UInt64?
+
     var success: Bool
     var errorMessage: String?
 }
+
+/// Sampling interval for batch_tts mode's per-item RunSampler. Deliberately
+/// coarser than runBlock's 100ms: batch items can legitimately run for
+/// minutes (the item-10 cliff ran 2482s+), and 100ms there would produce
+/// tens of thousands of samples in a single JSONL line. 1s is still far
+/// finer than the ~4-18s spacing already seen between consecutive [gen-hb]
+/// heartbeat lines (the C++-side per-20-frames stderr diagnostic), so the
+/// thermal curve stays well-resolved relative to that existing signal.
+let batchThermalSamplingIntervalMs = 1000.0
 
 /// Parses the batch manifest. Blank lines are skipped silently; a line with
 /// no tab, or an empty id/text after splitting, is reported via `sink` as a
@@ -949,6 +982,23 @@ enum BenchmarkHarness {
         var sanityFailed = 0
         var synthesisFailed = 0
 
+        // Optional forced inter-item cooldown (added 2026-08-29, PM
+        // request), off by default (0 = no pause, identical to prior
+        // behavior). Exists to tell apart two hypotheses for the item-10
+        // cliff seen in session-test attempts 2/3 (item 10 — same input
+        // text, byte-for-byte, as item 0 — ran 2482s+ without finishing vs.
+        // item 0's 36s): if inserting a cooldown between every item pushes
+        // the cliff back or removes it, that is thermal-throttling evidence
+        // (and good news product-wise: a scheduling mitigation, not an
+        // engine defect); if the cliff still lands at item 10 regardless,
+        // thermal is ruled out and the investigation moves to in-process
+        // state accumulation instead.
+        let batchItemCooldownSeconds: Double = {
+            guard let raw = ProcessInfo.processInfo.environment["QWEN3_TTS_BATCH_ITEM_COOLDOWN_SECONDS"],
+                  let v = Double(raw), v > 0 else { return 0 }
+            return v
+        }()
+
         for (index, spec) in specs.enumerated() {
             var params = Qwen3TtsParams()
             qwen3_tts_default_params(&params)
@@ -973,6 +1023,10 @@ enum BenchmarkHarness {
             // same rationale as run_started in runBlock above.
             sink.writeCodable("batch_item_started", metrics)
 
+            let beforeThermal = ProcessInfo.processInfo.thermalState
+            let sampler = RunSampler(intervalMs: batchThermalSamplingIntervalMs)
+            sampler.start()
+
             let t0 = Date()
             let audio = spec.text.withCString { textC -> UnsafeMutablePointer<Qwen3TtsAudio>? in
                 withUnsafePointer(to: params) { paramsPtr in
@@ -980,8 +1034,14 @@ enum BenchmarkHarness {
                 }
             }
             let elapsedMs = Date().timeIntervalSince(t0) * 1000
+            let (peakPhys, _, thermalSamples) = sampler.stop()
+
             metrics.completedAt = isoNow()
             metrics.wallClockMs = elapsedMs
+            metrics.thermalStateBefore = thermalStateString(beforeThermal)
+            metrics.thermalStateAfter = thermalStateString(ProcessInfo.processInfo.thermalState)
+            metrics.thermalSamples = thermalSamples
+            metrics.physFootprintPeakBytes = max(peakPhys, currentPhysFootprintBytes())
 
             if let audio = audio {
                 let nSamples = audio.pointee.n_samples
@@ -1033,6 +1093,28 @@ enum BenchmarkHarness {
             }
 
             sink.writeCodable("batch_item_completed", metrics)
+
+            // See batchItemCooldownSeconds' doc comment above. Skipped after
+            // the last item — nothing left to protect from thermal carry-
+            // over. Thermal state is recorded on both sides of the sleep
+            // (not just assumed) so a report can show whether the requested
+            // pause actually brought the device back toward `.nominal` or
+            // not, same evidentiary standard as cooldownBeforeBlock's
+            // CooldownRecord for the benchmark mode's backend transitions.
+            if batchItemCooldownSeconds > 0 && index < specs.count - 1 {
+                let coolBeforeThermal = ProcessInfo.processInfo.thermalState
+                let coolT0 = Date()
+                Thread.sleep(forTimeInterval: batchItemCooldownSeconds)
+                let actualCooldownS = Date().timeIntervalSince(coolT0)
+                sink.writeEvent("batch_item_cooldown", [
+                    "afterItemIndex": index,
+                    "afterItemId": spec.id,
+                    "requestedCooldownSeconds": batchItemCooldownSeconds,
+                    "actualCooldownSeconds": actualCooldownS,
+                    "thermalStateBeforeCooldown": thermalStateString(coolBeforeThermal),
+                    "thermalStateAfterCooldown": thermalStateString(ProcessInfo.processInfo.thermalState),
+                ])
+            }
         }
 
         sink.writeEvent("batch_completed", [
@@ -1079,6 +1161,22 @@ enum BenchmarkHarness {
     ///           phase0/ipad-bench/scripts/run_batch_tts.sh (parent repo,
     ///           new file — run_bench.sh itself is untouched) for the
     ///           host-side push/launch/pull sequence.
+    ///
+    ///           Each item's BatchItemMetrics now also records
+    ///           thermalStateBefore/After and a full thermalSamples curve
+    ///           (added 2026-08-29 — see the doc comment on that struct for
+    ///           why: batch_tts mode previously recorded no thermal data at
+    ///           all, despite being the mode the >=15-item session test
+    ///           uses, and thermal throttling is the leading hypothesis for
+    ///           that test's item-10 cliff). An optional additional env var,
+    ///           `QWEN3_TTS_BATCH_ITEM_COOLDOWN_SECONDS` (default 0 = off),
+    ///           forces a sleep of that many seconds between every item,
+    ///           recording a `batch_item_cooldown` event with thermalState
+    ///           on both sides of the sleep — this is the decisive
+    ///           thermal-vs-state-accumulation experiment: if a per-item
+    ///           cooldown pushes the cliff back or removes it, that's
+    ///           thermal; if the cliff still lands at the same item
+    ///           regardless, it isn't.
     static func run() {
         let env = ProcessInfo.processInfo.environment
         let mode = (env["QWEN3_TTS_BENCH_MODE"] ?? "run").lowercased()
