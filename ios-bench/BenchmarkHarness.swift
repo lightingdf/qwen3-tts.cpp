@@ -309,6 +309,109 @@ struct CooldownRecord: Codable {
     let reachedNominal: Bool
 }
 
+// MARK: - Batch TTS export (issue #3 sample generation, added 2026-08-28)
+//
+// NOT a benchmark: no 5-run repetition, no backend-comparison block
+// structure, no RTF/thermal acceptance gate. Issue #3 (splice-prototype
+// crossfade-law investigation) needs real on-device TTS audio for its
+// "unedited reference" and "self-splice reference" sample categories —
+// both of which only need plain TTS, never voice cloning/ICL (the C++
+// engine has no ICL implementation at all yet; grepping src/ and include/
+// turns up no ref_text/in-context-learning code path — ICL only exists in
+// the Python/MLX side, and porting it is Phase 1 work, not this). This
+// mode exists purely to turn Engineer 2's paragraph manifest into WAVs,
+// on the real device, as cheaply as possible. Per PM's explicit scope cut:
+// no UI, no per-item parameter tuning, no streaming, no progress callback.
+
+/// One line of the batch TTS manifest: plain TSV, no header,
+/// `sample_id<TAB>paragraph_text`. Engineer 2's manifest generator
+/// (phase0/splice-prototype) asserts on export that paragraph_text never
+/// contains a literal tab or newline, so splitting each line on the first
+/// tab is safe — a malformed line is reported and skipped, not silently
+/// misparsed.
+struct BatchItemSpec {
+    let id: String
+    let text: String
+}
+
+struct BatchItemMetrics: Codable {
+    let itemIndex: Int
+    let itemId: String
+    let backend: String
+    let entitlementVariant: String
+    let nThreads: Int32
+    let textLength: Int
+    var startedAt: String
+    var completedAt: String?
+    var wallClockMs: Double?
+    var audioDurationS: Double?
+    var rtf: Double?
+    var maxAudioTokensUsed: Int32?
+
+    var nSamples: Int32?
+    var sampleRate: Int32?
+    var rmsAmplitude: Double?
+    var peakAmplitude: Double?
+    var clippedSampleFraction: Double?
+    var outputSanityPassed: Bool?
+    var outputSanityNotes: [String]?
+    var savedWavPath: String?
+
+    var success: Bool
+    var errorMessage: String?
+}
+
+/// Parses the batch manifest. Blank lines are skipped silently; a line with
+/// no tab, or an empty id/text after splitting, is reported via `sink` as a
+/// `batch_manifest_parse_error` event and skipped — one bad line shouldn't
+/// cost the other items' worth of on-device generation time, and the report
+/// still needs a record of exactly what was skipped and why.
+func parseBatchManifest(url: URL, sink: ResultSink) -> [BatchItemSpec] {
+    guard let contents = try? String(contentsOf: url, encoding: .utf8) else {
+        sink.writeEvent("batch_manifest_read_failed", ["path": url.path])
+        return []
+    }
+    var specs: [BatchItemSpec] = []
+    let lines = contents.split(separator: "\n", omittingEmptySubsequences: false)
+    for (idx, rawLine) in lines.enumerated() {
+        let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+        if line.isEmpty { continue }
+        guard let tabRange = line.range(of: "\t") else {
+            sink.writeEvent("batch_manifest_parse_error", [
+                "lineNumber": idx + 1, "line": line, "reason": "no tab separator found",
+            ])
+            continue
+        }
+        let id = String(line[line.startIndex..<tabRange.lowerBound])
+        let text = String(line[tabRange.upperBound...])
+        if id.isEmpty || text.isEmpty {
+            sink.writeEvent("batch_manifest_parse_error", [
+                "lineNumber": idx + 1, "line": line, "reason": "empty id or text after split",
+            ])
+            continue
+        }
+        specs.append(BatchItemSpec(id: id, text: text))
+    }
+    return specs
+}
+
+/// Scales `Qwen3TtsParams.max_audio_tokens` (default 4096) up for batch
+/// paragraphs longer than issue #1's fixed ~100-character benchmark text.
+/// 4096 never truncated that benchmark (observed audio duration 19-23s,
+/// well inside it), but issue #3's paragraphs run five-to-six sentences —
+/// several times longer — and a truncation here fails SILENTLY at the
+/// qwen3_tts_synthesize layer (a shorter Qwen3TtsAudio, no error), only
+/// surfacing downstream as a tripped byte-exact assertion in the splice
+/// prototype after an already-paid generation cost. Scale by input length
+/// relative to the benchmark text, plus a 2x safety margin: ordinary
+/// inputs still stop early via the model's own stop condition, so a higher
+/// cap costs nothing when it isn't needed.
+func maxAudioTokens(forTextLength textLength: Int, defaultCap: Int32 = 4096, referenceTextLength: Int = 100) -> Int32 {
+    let scale = max(1.0, Double(textLength) / Double(referenceTextLength))
+    let safetyFactor = 2.0
+    return Int32((Double(defaultCap) * scale * safetyFactor).rounded(.up))
+}
+
 // MARK: - JSONL result sink (crash/jetsam-kill-safe)
 
 /// Append-only, fsync'd-per-write JSONL sink. Every event is flushed to
@@ -473,8 +576,20 @@ func evaluateOutputSanity(
 ) -> OutputSanityCheck {
     var notes: [String] = []
 
-    let minExpectedS = 15.0
-    let maxExpectedS = 45.0
+    // Scaled from the original fixed bounds for issue #1's ~100-character
+    // benchmark text (15s, 45s) — i.e. 0.15 s/char and 0.45 s/char, which
+    // reproduces exactly [15, 45] at expectedTextLength=100 so issue #1's
+    // own gate is unchanged. This is now scaled by expectedTextLength (with
+    // an absolute floor so very short strings still get a sane minimum
+    // window) because this same function is shared with issue #3's batch
+    // TTS export (see runBatchTts below), whose items are NOT all ~100
+    // characters — a fixed [15, 45]s window would wrongly flag short or
+    // long items as invalid regardless of whether the audio is fine.
+    let minSPerChar = 0.15
+    let maxSPerChar = 0.45
+    let absoluteFloorS = 1.0
+    let minExpectedS = max(absoluteFloorS, Double(expectedTextLength) * minSPerChar)
+    let maxExpectedS = max(minExpectedS + 1.0, Double(expectedTextLength) * maxSPerChar)
     if audioDurationS < minExpectedS || audioDurationS > maxExpectedS {
         notes.append("audioDurationS=\(audioDurationS) outside expected [\(minExpectedS), \(maxExpectedS)]s for a ~\(expectedTextLength)-character Mandarin passage")
     }
@@ -768,6 +883,166 @@ enum BenchmarkHarness {
             .appendingPathComponent("bench_cooldown.jsonl")
     }
 
+    /// Batch manifest location (issue #3). Filename overridable via
+    /// `QWEN3_TTS_BATCH_MANIFEST_FILENAME` so the host-side script can push
+    /// e.g. `tts_paragraphs.tsv` under its own name without a hardcoded
+    /// coupling to Engineer 2's filename.
+    static var batchManifestFileURL: URL {
+        let name = ProcessInfo.processInfo.environment["QWEN3_TTS_BATCH_MANIFEST_FILENAME"] ?? "tts_paragraphs.tsv"
+        return FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent(name)
+    }
+
+    /// One WAV per manifest line, filename == sample_id (per PM: "文件名用
+    /// sample_id,方便它直接对应回去") so the host side / splice prototype can
+    /// map results back to manifest rows without any extra lookup table.
+    static var batchOutputDirURL: URL {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("batch_output", isDirectory: true)
+    }
+
+    static var batchResultsFileURL: URL {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("batch_results.jsonl")
+    }
+
+    /// Issue #3 batch TTS export — see the "Batch TTS export" section
+    /// comment above `BatchItemSpec` for scope. Loads the model ONCE (unlike
+    /// runBlock, there is no backend-comparison axis here — batch mode
+    /// always uses whatever QWEN3_TTS_BACKEND the launch env set, same
+    /// read-only mechanism as the benchmark) and generates every manifest
+    /// item against that single loaded engine, writing one WAV each.
+    static func runBatchTts(sink: ResultSink) {
+        let specs = parseBatchManifest(url: batchManifestFileURL, sink: sink)
+        sink.writeEvent("batch_started", [
+            "manifestPath": batchManifestFileURL.path,
+            "itemCount": specs.count,
+            "backend": benchBackendLabel,
+            "entitlementVariant": benchEntitlementLabel,
+        ])
+        if specs.isEmpty {
+            sink.writeEvent("batch_completed", [
+                "itemCount": 0, "succeeded": 0, "sanityFailed": 0, "synthesisFailed": 0,
+            ])
+            return
+        }
+
+        try? FileManager.default.createDirectory(at: batchOutputDirURL, withIntermediateDirectories: true)
+
+        let nThreads: Int32 = 4
+        let modelDirPath = modelDirURL.path
+        let modelLoadT0 = Date()
+        guard let tts = modelDirPath.withCString({ qwen3_tts_create($0, nThreads) }) else {
+            sink.writeEvent("fatal", ["message": "qwen3_tts_create failed for \(modelDirPath)"])
+            return
+        }
+        let modelLoadMs = Date().timeIntervalSince(modelLoadT0) * 1000
+        sink.writeEvent("model_loaded", [
+            "backend": benchBackendLabel,
+            "entitlementVariant": benchEntitlementLabel,
+            "nThreads": nThreads,
+            "modelLoadMs": modelLoadMs,
+        ])
+        defer { qwen3_tts_destroy(tts) }
+
+        var succeeded = 0
+        var sanityFailed = 0
+        var synthesisFailed = 0
+
+        for (index, spec) in specs.enumerated() {
+            var params = Qwen3TtsParams()
+            qwen3_tts_default_params(&params)
+            params.language_id = 2055 // zh
+            params.n_threads = nThreads
+            let cappedTokens = maxAudioTokens(forTextLength: spec.text.count)
+            params.max_audio_tokens = cappedTokens
+
+            var metrics = BatchItemMetrics(
+                itemIndex: index,
+                itemId: spec.id,
+                backend: benchBackendLabel,
+                entitlementVariant: benchEntitlementLabel,
+                nThreads: nThreads,
+                textLength: spec.text.count,
+                startedAt: isoNow(),
+                maxAudioTokensUsed: cappedTokens,
+                success: false
+            )
+            // Written before generation so a mid-batch crash/kill leaves a
+            // clear forensic trail of exactly which item was in flight —
+            // same rationale as run_started in runBlock above.
+            sink.writeCodable("batch_item_started", metrics)
+
+            let t0 = Date()
+            let audio = spec.text.withCString { textC -> UnsafeMutablePointer<Qwen3TtsAudio>? in
+                withUnsafePointer(to: params) { paramsPtr in
+                    qwen3_tts_synthesize(tts, textC, paramsPtr)
+                }
+            }
+            let elapsedMs = Date().timeIntervalSince(t0) * 1000
+            metrics.completedAt = isoNow()
+            metrics.wallClockMs = elapsedMs
+
+            if let audio = audio {
+                let nSamples = audio.pointee.n_samples
+                let sampleRate = audio.pointee.sample_rate
+                let audioDurationS = Double(nSamples) / Double(sampleRate)
+                metrics.audioDurationS = audioDurationS
+                metrics.rtf = audioDurationS > 0 ? (elapsedMs / 1000.0) / audioDurationS : nil
+                metrics.nSamples = nSamples
+                metrics.sampleRate = sampleRate
+
+                let samplesBuffer = UnsafeBufferPointer(start: audio.pointee.samples, count: Int(nSamples))
+                let sanity = evaluateOutputSanity(
+                    samples: samplesBuffer,
+                    sampleRate: sampleRate,
+                    audioDurationS: audioDurationS,
+                    expectedTextLength: spec.text.count
+                )
+                metrics.rmsAmplitude = sanity.rms
+                metrics.peakAmplitude = sanity.peak
+                metrics.clippedSampleFraction = sanity.clippedFraction
+                metrics.outputSanityPassed = sanity.passed
+                metrics.outputSanityNotes = sanity.notes
+                if !sanity.passed { sanityFailed += 1 }
+
+                // Every item is the actual deliverable here (unlike issue
+                // #1's benchmark, where only run 1 per block was saved) —
+                // all ten get their own WAV.
+                let wavURL = batchOutputDirURL.appendingPathComponent("\(spec.id).wav")
+                do {
+                    try writeWav(samples: samplesBuffer, sampleRate: sampleRate, to: wavURL)
+                    metrics.savedWavPath = wavURL.path
+                } catch {
+                    sink.writeEvent("batch_wav_write_failed", [
+                        "itemId": spec.id, "path": wavURL.path, "error": String(describing: error),
+                    ])
+                }
+
+                metrics.success = true
+                succeeded += 1
+                qwen3_tts_free_audio(audio)
+            } else {
+                // One item failing does not abort the batch — this is an
+                // unattended device-side generation tool; losing one item to
+                // a transient failure shouldn't cost the rest their
+                // generation time too.
+                metrics.success = false
+                metrics.errorMessage = String(cString: qwen3_tts_get_error(tts))
+                synthesisFailed += 1
+            }
+
+            sink.writeCodable("batch_item_completed", metrics)
+        }
+
+        sink.writeEvent("batch_completed", [
+            "itemCount": specs.count,
+            "succeeded": succeeded,
+            "sanityFailed": sanityFailed,
+            "synthesisFailed": synthesisFailed,
+        ])
+    }
+
     /// Entry point — call this from the app target once wired up (e.g.
     /// from `applicationDidFinishLaunching` or a SwiftUI `.task {}`).
     ///
@@ -791,6 +1066,19 @@ enum BenchmarkHarness {
     ///
     /// See phase0/ipad-bench/scripts/run_bench.sh (parent repo) for the
     /// actual host-side orchestration that issues these three launches.
+    ///
+    /// A third, independent mode (added for issue #3, 2026-08-28):
+    ///
+    ///   `-e '{"QWEN3_TTS_BENCH_MODE":"batch_tts"}'`
+    ///        -> reads Documents/tts_paragraphs.tsv (or whichever filename
+    ///           QWEN3_TTS_BATCH_MANIFEST_FILENAME names), generates one WAV
+    ///           per line into Documents/batch_output/, records
+    ///           Documents/batch_results.jsonl. Not a benchmark: single
+    ///           model load, one pass over the manifest, no 5x repetition,
+    ///           no backend-comparison structure. See
+    ///           phase0/ipad-bench/scripts/run_batch_tts.sh (parent repo,
+    ///           new file — run_bench.sh itself is untouched) for the
+    ///           host-side push/launch/pull sequence.
     static func run() {
         let env = ProcessInfo.processInfo.environment
         let mode = (env["QWEN3_TTS_BENCH_MODE"] ?? "run").lowercased()
@@ -810,6 +1098,15 @@ enum BenchmarkHarness {
             // forever waiting for a termination that never happens on its
             // own (the SwiftUI WindowGroup keeps the process alive
             // indefinitely otherwise).
+            exit(0)
+        }
+
+        if mode == "batch_tts" {
+            let sink = ResultSink(url: batchResultsFileURL)
+            runBatchTts(sink: sink)
+            sink.close()
+            // Same rationale as the cooldown branch above: nothing else
+            // terminates this process on its own.
             exit(0)
         }
 
