@@ -545,6 +545,17 @@ enum BenchmarkHarness {
             "entitlementVariant": benchEntitlementLabel,
             "numRuns": numRuns,
             "benchTextLength": benchText.count,
+            // Read at launch, before qwen3_tts_create / any model load, so
+            // this is available even if no model is staged yet. This is the
+            // decisive baseline/increased-memory-limit comparison point: if
+            // the increased-memory-limit entitlement did not actually take
+            // effect (e.g. a provisioning-profile/signing-certificate team
+            // mismatch caused the kernel to silently ignore it), this number
+            // will be indistinguishable between the two entitlement variants
+            // even though the entitlement is present in the signed binary.
+            "osAvailableMemoryAtLaunchBytes": currentOsProcAvailableMemoryBytes(),
+            "physFootprintAtLaunchBytes": currentPhysFootprintBytes(),
+            "physicalMemoryBytes": ProcessInfo.processInfo.physicalMemory,
         ])
 
         // Default thread count mirrors qwen3-tts.cpp's own CLI default (4).
