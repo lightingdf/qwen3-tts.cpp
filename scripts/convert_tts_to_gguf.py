@@ -307,13 +307,30 @@ class Qwen3TTSConverter:
             if not self._should_quantize(tensor_name):
                 logger.debug(f"Keeping {tensor_name} in F16 (not quantizing)")
                 return data.astype(np.float16), gguf.GGMLQuantizationType.F16
-            
+
             data = data.astype(np.float32)
             try:
                 quantized = gguf.quants.quantize(data, gguf.GGMLQuantizationType.Q4_K)
                 return quantized, gguf.GGMLQuantizationType.Q4_K
             except Exception as e:
                 logger.warning(f"Q4_K quantization failed for {tensor_name}: {e}, falling back to F16")
+                return data.astype(np.float16), gguf.GGMLQuantizationType.F16
+        elif self.output_type == "q4_0":
+            # NOTE: gguf-py's Q4_K only implements dequantize_blocks (no quantize_blocks),
+            # so "q4_k" above silently falls back to F16 for every 2D+ tensor (verified by
+            # calling gguf.quants.quantize(..., Q4_K) directly: raises NotImplementedError
+            # from __Quant.quantize_blocks). Q4_0 is fully implemented in gguf-py, so use it
+            # as the real Q4 tier for this conversion path.
+            if not self._should_quantize(tensor_name):
+                logger.debug(f"Keeping {tensor_name} in F16 (not quantizing)")
+                return data.astype(np.float16), gguf.GGMLQuantizationType.F16
+
+            data = data.astype(np.float32)
+            try:
+                quantized = gguf.quants.quantize(data, gguf.GGMLQuantizationType.Q4_0)
+                return quantized, gguf.GGMLQuantizationType.Q4_0
+            except Exception as e:
+                logger.warning(f"Q4_0 quantization failed for {tensor_name}: {e}, falling back to F16")
                 return data.astype(np.float16), gguf.GGMLQuantizationType.F16
         else:
             return data.astype(np.float16), gguf.GGMLQuantizationType.F16
@@ -430,6 +447,8 @@ class Qwen3TTSConverter:
             ftype = gguf.LlamaFileType.MOSTLY_Q8_0
         elif self.output_type == "q4_k":
             ftype = gguf.LlamaFileType.MOSTLY_Q4_K_M
+        elif self.output_type == "q4_0":
+            ftype = gguf.LlamaFileType.MOSTLY_Q4_0
         else:
             ftype = gguf.LlamaFileType.MOSTLY_F16
         writer.add_file_type(ftype)
@@ -542,9 +561,12 @@ def main():
     )
     parser.add_argument(
         "--type", "-t",
-        choices=["f16", "f32", "q8_0", "q4_k"],
+        choices=["f16", "f32", "q8_0", "q4_k", "q4_0"],
         default="f16",
-        help="Output data type (default: f16). q8_0 provides ~50%% size reduction, q4_k provides ~70%% size reduction."
+        help="Output data type (default: f16). q8_0 provides ~50%% size reduction. "
+             "q4_k is currently a no-op fallback to f16 in this gguf-py version "
+             "(Q4_K quantize_blocks is unimplemented upstream); use q4_0 for a real "
+             "~75%% size reduction Q4 tier."
     )
     parser.add_argument(
         "--verbose", "-v",

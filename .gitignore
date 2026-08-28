@@ -1,5 +1,8 @@
 # Build
 build/
+build-*/
+ggml/build/
+ggml/build-*/
 *.o
 *.a
 *.so

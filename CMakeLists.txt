@@ -11,7 +11,14 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 # Compiler flags
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -Wpedantic")
-    set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -march=native")
+    # -march=native requires the compiler to probe the *host* CPU, which is
+    # meaningless (and fails outright) when cross-compiling for iOS/tvOS/etc.
+    # Only apply it for native (non-cross-compiling) builds, i.e. plain macOS.
+    if(NOT CMAKE_SYSTEM_NAME MATCHES "iOS|tvOS|visionOS|watchOS")
+        set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -march=native")
+    else()
+        set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3")
+    endif()
     set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g -O0")
 endif()
 
@@ -36,7 +43,11 @@ find_package(Threads REQUIRED)
 
 # GGML library paths
 set(GGML_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ggml")
-set(GGML_BUILD_DIR "${GGML_DIR}/build")
+# Allow pointing at an alternate pre-built GGML tree (e.g. a cross-compiled
+# ggml/build-ios) via -DGGML_BUILD_DIR=... on the cmake command line.
+if(NOT DEFINED GGML_BUILD_DIR)
+    set(GGML_BUILD_DIR "${GGML_DIR}/build")
+endif()
 
 # Detect Metal backend availability
 if(APPLE AND EXISTS "${GGML_BUILD_DIR}/src/ggml-metal/libggml-metal.dylib")
@@ -188,6 +199,16 @@ target_include_directories(qwen3tts_shared PUBLIC
 target_link_libraries(qwen3tts_shared PRIVATE
     qwen3_tts
 )
+if(APPLE)
+    # qwen3tts_c_api.cpp calls the Objective-C runtime directly (objc_msgSend
+    # etc.) to drive an NSAutoreleasePool around synthesis calls, without
+    # #import-ing anything that would otherwise pull in libobjc as a link
+    # dependency. On macOS this got linked in transitively via the CoreML
+    # (.mm) bridge target; with QWEN3_TTS_COREML=OFF (e.g. the iOS build)
+    # nothing else references libobjc and the link fails with undefined
+    # _objc_msgSend/_objc_getClass/_sel_registerName symbols.
+    target_link_libraries(qwen3tts_shared PRIVATE objc)
+endif()
 
 # CLI executable
 add_executable(qwen3-tts-cli
