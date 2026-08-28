@@ -1,0 +1,43 @@
+name: No model weights in git
+
+# Hard guard for the project-wide rule "model weights never get uploaded to
+# GitHub" (see VoiceEditor's CLAUDE.md hard constraints). This is a single,
+# narrow check — not a general CI pipeline — added alongside VoiceEditor
+# issue #1, whose submodule-vendoring investigation is what surfaced the gap:
+# nothing currently tracks a weight file, but there was no automated backstop
+# preventing a future `git add -f models/...` or a new, not-yet-ignored
+# weight path from slipping in as this repo keeps receiving commits.
+#
+# Scope is deliberately narrow: fail the build if any file tracked in the
+# ref being checked matches a known model-weight extension. Do not extend
+# this workflow with build/test/lint steps — those belong in their own
+# workflow if/when this project adds one.
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  forbid-weight-files:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fail if any tracked file looks like a model weight
+        run: |
+          set -euo pipefail
+          # Extensions used by the model formats this project deals with
+          # (GGUF quantized weights, safetensors, raw .bin weight dumps,
+          # ONNX). Deliberately checks the full tracked tree at the current
+          # ref, not just the diff, so a rename/history trick can't bypass
+          # it and so pre-existing violations are just as loud as new ones.
+          pattern='\.(gguf|safetensors|bin|onnx)$'
+          matches="$(git ls-files | grep -iE "${pattern}" || true)"
+          if [ -n "${matches}" ]; then
+            echo "::error::Tracked file(s) matching a model-weight extension were found. Model weights must never be committed to GitHub (see CLAUDE.md)."
+            echo "${matches}"
+            exit 1
+          fi
+          echo "OK: no tracked files match ${pattern}"
