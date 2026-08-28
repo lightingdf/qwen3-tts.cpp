@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <cctype>
 #include <sys/stat.h>
+#include <chrono>
 
 namespace qwen3_tts {
 
@@ -2648,19 +2649,34 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
     t1 = clk::now();
     timing.t_prefill_forward_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
 #endif
-    
+
+    // Opt-in per-frame heartbeat, added 2026-08-29 to diagnose an iPhone
+    // session-test hang observed stuck somewhere between "after-tokenize"
+    // and "after-generate" with zero visibility into where. Deliberately
+    // NOT gated behind params.print_progress/print_timing (those don't
+    // reach this function) and deliberately NOT wired into the default
+    // path -- opt-in via env var only, pure fprintf/fflush, no effect on
+    // control flow or numerics. Safe to leave in permanently.
+    const bool frame_heartbeat_enabled = (std::getenv("QWEN3_TTS_FRAME_HEARTBEAT") != nullptr);
+    const auto t_heartbeat_start = std::chrono::steady_clock::now();
+    if (frame_heartbeat_enabled) {
+        fprintf(stderr, "  [gen-hb] prefill done (prefill_len=%d), entering frame loop (max_len=%d)\n",
+                prefill_len, max_len);
+        fflush(stderr);
+    }
+
     output.clear();
     output.reserve(max_len * cfg.n_codebooks);
-    
+
     int32_t n_past = prefill_len;
     std::vector<int32_t> frame_codes(cfg.n_codebooks);
     std::unordered_set<int32_t> generated_cb0_tokens;
     const int32_t suppress_start = cfg.codec_vocab_size - 1024;
-    
+
     std::vector<float> probs(cfg.codec_vocab_size);
     std::vector<float> step_embd(cfg.hidden_size, 0.0f);
     std::vector<float> embd_row(cfg.hidden_size);
-    
+
     for (int frame = 0; frame < max_len; ++frame) {
         // Suppress tokens in [codec_vocab_size - 1024, codec_vocab_size), except codec_eos_id
         for (int32_t i = suppress_start; i < cfg.codec_vocab_size; ++i) {
@@ -2801,8 +2817,16 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
 #endif
         
         n_past++;
+
+        if (frame_heartbeat_enabled && (frame % 20 == 0 || frame + 1 >= max_len)) {
+            double elapsed_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t_heartbeat_start).count();
+            fprintf(stderr, "  [gen-hb] frame=%d/%d n_past=%d elapsed=%.0fms\n",
+                    frame, max_len, n_past, elapsed_ms);
+            fflush(stderr);
+        }
     }
-    
+
 #ifdef QWEN3_TTS_TIMING
     timing.t_generate_total_ms = std::chrono::duration<double, std::milli>(clk::now() - t_gen_start).count();
     timing_ = nullptr;

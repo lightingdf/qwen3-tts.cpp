@@ -15,7 +15,15 @@ settings:
   base:
     SWIFT_VERSION: "5.0"
     IPHONEOS_DEPLOYMENT_TARGET: "17.0"
-    TARGETED_DEVICE_FAMILY: "2"          # iPad only — see issue #1's hard device constraint
+    # "1,2" = iPhone + iPad. Was "2" (iPad only) through issue #1; widened
+    # 2026-08-29 for issue #4's iPhone 16 Pro run. Device selection is a
+    # separate, orthogonal axis handled entirely by DEVICE_ID in
+    # phase0/ipad-bench/scripts/run_bench*.sh (which UDID `devicectl`
+    # targets) — the same two signed builds below install on either a
+    # physical iPad or iPhone once this family restriction is lifted; no
+    # new target/bundle-id was needed for this, since BenchmarkHarness.swift
+    # has no device-specific UI to diverge on (console-driven, not visual).
+    TARGETED_DEVICE_FAMILY: "1,2"
     SUPPORTED_PLATFORMS: iphoneos        # device only; the linked .a's are arm64 *device* slices,
     SDKROOT: iphoneos                    # not simulator slices, even though both are arm64 on Apple Silicon
     ONLY_ACTIVE_ARCH: NO

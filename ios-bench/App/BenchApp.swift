@@ -1,8 +1,10 @@
 // BenchApp.swift
 //
-// Minimal SwiftUI app shell for VoiceEditor issue #1's on-device benchmark.
+// Minimal SwiftUI app shell for VoiceEditor's on-device benchmark (issue #1
+// on iPad, issue #4 on iPhone — same harness, same two targets, device
+// picked at launch time via `devicectl`'s --device UDID, not a build axis).
 // This target has no product purpose beyond driving BenchmarkHarness.run()
-// on a real, physically-present iPad — see ios-bench/BenchmarkHarness.swift
+// on a real, physically-present device — see ios-bench/BenchmarkHarness.swift
 // for the actual measurement logic and phase0/ipad-bench/README.md (parent
 // repo) for how it's launched via `xcrun devicectl`.
 //
@@ -55,7 +57,7 @@ final class BenchAppDelegate: NSObject, UIApplicationDelegate {
 struct BenchStatusView: View {
     var body: some View {
         VStack(spacing: 12) {
-            Text("VoiceEditor iPad Benchmark")
+            Text("VoiceEditor Benchmark (\(UIDevice.current.model))")
                 .font(.headline)
             Text("backend=\(benchBackendLabel)  entitlement=\(benchEntitlementLabel)")
                 .font(.caption)
