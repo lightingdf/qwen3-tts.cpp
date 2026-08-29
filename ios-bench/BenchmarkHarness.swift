@@ -947,11 +947,21 @@ enum BenchmarkHarness {
     /// item against that single loaded engine, writing one WAV each.
     static func runBatchTts(sink: ResultSink) {
         let specs = parseBatchManifest(url: batchManifestFileURL, sink: sink)
+        // Round-level thermal state, recorded immediately (added 2026-08-29,
+        // PM: A/B comparisons across rounds — e.g. pre-fix vs post-fix — are
+        // only valid if both rounds start from a comparable thermal state;
+        // otherwise "which round ran" is a hidden confound. This makes the
+        // starting state visible both in the JSONL (thermalStateAtStart) and
+        // in the raw console log (so it's checkable without pulling/parsing
+        // the JSONL), before a single item has run.
+        let startThermal = thermalStateString(ProcessInfo.processInfo.thermalState)
+        fputs("  [thermal] batch_tts starting: entitlement=\(benchEntitlementLabel) backend=\(benchBackendLabel) thermalStateAtStart=\(startThermal)\n", stderr)
         sink.writeEvent("batch_started", [
             "manifestPath": batchManifestFileURL.path,
             "itemCount": specs.count,
             "backend": benchBackendLabel,
             "entitlementVariant": benchEntitlementLabel,
+            "thermalStateAtStart": startThermal,
         ])
         if specs.isEmpty {
             sink.writeEvent("batch_completed", [
@@ -1007,6 +1017,18 @@ enum BenchmarkHarness {
             let cappedTokens = maxAudioTokens(forTextLength: spec.text.count)
             params.max_audio_tokens = cappedTokens
 
+            // Captured BEFORE the item_started write (added 2026-08-29, PM:
+            // thermal state is an uncontrolled confound that can silently
+            // decide whether an item finishes in seconds or stalls
+            // indefinitely — see the Round 3 IncreasedMem retro, item 3
+            // started already "serious"). Previously this was only recorded
+            // on `beforeThermal` and attached to `metrics` after generation
+            // finished, so a stalled/killed item left NO record of what
+            // thermal state it actually started in. Setting it on `metrics`
+            // before the first `writeCodable` call means it's on disk
+            // (fsync'd) immediately, before the item even begins running —
+            // available even if this item never completes.
+            let beforeThermal = ProcessInfo.processInfo.thermalState
             var metrics = BatchItemMetrics(
                 itemIndex: index,
                 itemId: spec.id,
@@ -1018,12 +1040,12 @@ enum BenchmarkHarness {
                 maxAudioTokensUsed: cappedTokens,
                 success: false
             )
+            metrics.thermalStateBefore = thermalStateString(beforeThermal)
             // Written before generation so a mid-batch crash/kill leaves a
             // clear forensic trail of exactly which item was in flight —
             // same rationale as run_started in runBlock above.
             sink.writeCodable("batch_item_started", metrics)
 
-            let beforeThermal = ProcessInfo.processInfo.thermalState
             let sampler = RunSampler(intervalMs: batchThermalSamplingIntervalMs)
             sampler.start()
 
@@ -1038,7 +1060,8 @@ enum BenchmarkHarness {
 
             metrics.completedAt = isoNow()
             metrics.wallClockMs = elapsedMs
-            metrics.thermalStateBefore = thermalStateString(beforeThermal)
+            // thermalStateBefore already set (and flushed) before generation
+            // started, above — not reassigned here.
             metrics.thermalStateAfter = thermalStateString(ProcessInfo.processInfo.thermalState)
             metrics.thermalSamples = thermalSamples
             metrics.physFootprintPeakBytes = max(peakPhys, currentPhysFootprintBytes())
@@ -1104,7 +1127,36 @@ enum BenchmarkHarness {
             if batchItemCooldownSeconds > 0 && index < specs.count - 1 {
                 let coolBeforeThermal = ProcessInfo.processInfo.thermalState
                 let coolT0 = Date()
-                Thread.sleep(forTimeInterval: batchItemCooldownSeconds)
+
+                // Chunked sleep + stderr heartbeat (added 2026-08-29, after
+                // the first cooldown attempt died mid-pause): a single bare
+                // Thread.sleep(60) with zero stdout/stderr activity for the
+                // whole window was followed by the devicectl `--console`
+                // tunnel dying ("connection was invalidated") within ~1s of
+                // the cooldown's expected end -- timing far too tight to be
+                // coincidence, pointing at an idle-timeout on the tunnel/
+                // watchdog rather than random flakiness. Splitting the sleep
+                // into small chunks with a tiny stderr line after each one
+                // (stderr, unbuffered by default, same channel the C++
+                // [gen-hb]/[mem] diagnostics already stream on successfully
+                // for the run's full duration) keeps the console stream
+                // visibly alive. This also closes the "no mid-cooldown
+                // thermal sampling" gap: previously thermalState was only
+                // captured once before and once after the entire pause.
+                let cooldownChunkSeconds = min(5.0, batchItemCooldownSeconds)
+                var elapsedCooldownS = 0.0
+                var cooldownThermalSamples: [[String: Any]] = []
+                while elapsedCooldownS < batchItemCooldownSeconds {
+                    let thisChunk = min(cooldownChunkSeconds, batchItemCooldownSeconds - elapsedCooldownS)
+                    Thread.sleep(forTimeInterval: thisChunk)
+                    elapsedCooldownS += thisChunk
+                    let thermalNow = thermalStateString(ProcessInfo.processInfo.thermalState)
+                    cooldownThermalSamples.append([
+                        "elapsedCooldownSeconds": elapsedCooldownS,
+                        "thermalState": thermalNow,
+                    ])
+                    fputs("  [cooldown-hb] afterItem=\(index) elapsedS=\(Int(elapsedCooldownS))/\(Int(batchItemCooldownSeconds)) thermal=\(thermalNow)\n", stderr)
+                }
                 let actualCooldownS = Date().timeIntervalSince(coolT0)
                 sink.writeEvent("batch_item_cooldown", [
                     "afterItemIndex": index,
@@ -1113,6 +1165,7 @@ enum BenchmarkHarness {
                     "actualCooldownSeconds": actualCooldownS,
                     "thermalStateBeforeCooldown": thermalStateString(coolBeforeThermal),
                     "thermalStateAfterCooldown": thermalStateString(ProcessInfo.processInfo.thermalState),
+                    "thermalSamplesDuringCooldown": cooldownThermalSamples,
                 ])
             }
         }
@@ -1200,6 +1253,25 @@ enum BenchmarkHarness {
         }
 
         if mode == "batch_tts" {
+            // Clear any leftover output from a previous batch_tts run BEFORE
+            // opening the sink (added 2026-08-29, PM: Documents/batch_output
+            // and batch_results.jsonl were never cleared between runs, so a
+            // killed/retried round's fresh results sat mixed in with an
+            // earlier round's stale WAVs/JSONL lines with no error and no
+            // visual difference other than file mtime — nearly mistaken for
+            // this run's own evidence. Same "stale data looks like fresh
+            // data" failure class as ADR 0004.
+            //
+            // MUST happen before ResultSink(url:) opens its FileHandle:
+            // removing the file out from under an already-open handle would
+            // just unlink the path while the handle keeps writing to the
+            // now-nameless old inode — the new file a later `ls`/pull would
+            // see would still be empty/stale, and this run's own events
+            // would be silently lost once the process exits. Removing first,
+            // then constructing ResultSink (which creates a fresh empty file
+            // if none exists), avoids that.
+            try? FileManager.default.removeItem(at: batchResultsFileURL)
+            try? FileManager.default.removeItem(at: batchOutputDirURL)
             let sink = ResultSink(url: batchResultsFileURL)
             runBatchTts(sink: sink)
             sink.close()
