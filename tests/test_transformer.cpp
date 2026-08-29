@@ -181,6 +181,25 @@ int main(int argc, char ** argv) {
     printf("  Code predictor: layers=%d, vocab_size=%d\n", config.code_pred_layers, config.code_pred_vocab_size);
     test_pass("Model loaded successfully");
 
+    // load_model() must have pre-reserved both KV caches and the compute
+    // arena already (issue #7 / ADR 0005), before any explicit
+    // init_kv_cache() call below touches them. Checked here, immediately
+    // after load, since Test 2 deliberately re-inits the talker cache to a
+    // smaller explicit size for its own purposes and would otherwise mask
+    // this check.
+    {
+        const int32_t ctx_after_load = transformer.get_kv_cache_ctx();
+        const int32_t code_pred_ctx_after_load = transformer.get_code_pred_kv_cache_ctx();
+        printf("  KV cache ctx right after load_model(): talker=%d (expect >= %d), code_pred=%d (expect >= 16)\n",
+               ctx_after_load, QWEN3_TTS_DEFAULT_RESERVE_CTX, code_pred_ctx_after_load);
+        if (ctx_after_load < QWEN3_TTS_DEFAULT_RESERVE_CTX || code_pred_ctx_after_load < 16) {
+            printf("  FAIL: KV caches were not pre-reserved at load time\n");
+            fail_count++;
+        } else {
+            test_pass("Both KV caches pre-reserved at load time (issue #7 / ADR 0005)");
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Test 2: Initialize KV cache
     // -----------------------------------------------------------------------
@@ -460,7 +479,78 @@ int main(int argc, char ** argv) {
     }
 
     // -----------------------------------------------------------------------
-    // Test 6: Summary statistics
+    // Test 6: KV-cache reuse / no-gratuitous-shrink regression test
+    //   (issue #7 / ADR 0005 -- generation-engine memory fragmentation)
+    //
+    //   Contract under test: once the talker KV cache is pre-reserved at
+    //   load time (asserted right after Test 1, before Test 2's explicit
+    //   re-init touches it), it must only ever grow across generate()
+    //   calls, never shrink just because a call's required_ctx happens to
+    //   be smaller than what's currently reserved. The old buggy condition
+    //     (n_ctx < required_ctx || n_ctx > max(required_ctx * 2, 512))
+    //   would tear down and rebuild this (large) buffer on almost every
+    //   call whenever input text length varied -- the concrete
+    //   free/realloc-churn fragmentation driver Phase 0 diagnosed on
+    //   device. This test drives max_len up and down across >= 15
+    //   consecutive calls on a single loaded instance -- exactly the
+    //   pattern that used to trip the shrink branch -- and asserts the
+    //   reserved ctx size is monotonically non-decreasing and every call
+    //   still succeeds. It cannot reproduce the device-level OOM/abort
+    //   itself (that needs the real memory-constrained hardware + the
+    //   >= 15-call, 200-400-char session test from issue #7's AC), but it
+    //   pins the allocator-reuse contract at the unit level so a future
+    //   regression is caught on every build, not just on-device.
+    // -----------------------------------------------------------------------
+    printf("Test %d: KV-cache reuse / no-gratuitous-shrink regression test\n", ++test_num);
+    {
+        const int32_t ctx_before = transformer.get_kv_cache_ctx();
+        printf("  KV cache ctx before this test's call sequence: %d\n", ctx_before);
+
+        bool reuse_ok = true;
+
+        // Alternate short/long max_len to reproduce the call-history pattern
+        // (varying required_ctx) that used to trigger the shrink branch.
+        const int32_t max_lens[] = { 32, 128, 16, 96, 8, 150, 24, 110, 12, 140, 20, 100, 10, 130, 30 };
+        const int n_calls = (int)(sizeof(max_lens) / sizeof(max_lens[0]));
+        int32_t prev_ctx = ctx_before;
+        int calls_ok = 0;
+
+        for (int i = 0; i < n_calls && reuse_ok; ++i) {
+            std::vector<int32_t> codes;
+            bool ok = transformer.generate(
+                text_tokens.data(), n_tokens, spk_ptr, max_lens[i],
+                codes, 2050, 1.05f, 0.9f, 50);
+
+            if (!ok) {
+                printf("  FAIL: generate() call %d/%d (max_len=%d) failed: %s\n",
+                       i + 1, n_calls, max_lens[i], transformer.get_error().c_str());
+                reuse_ok = false;
+                break;
+            }
+            calls_ok++;
+
+            const int32_t cur_ctx = transformer.get_kv_cache_ctx();
+            if (cur_ctx < prev_ctx) {
+                printf("  FAIL: KV cache shrank on call %d/%d (max_len=%d): n_ctx %d -> %d\n",
+                       i + 1, n_calls, max_lens[i], prev_ctx, cur_ctx);
+                reuse_ok = false;
+                break;
+            }
+            prev_ctx = cur_ctx;
+        }
+
+        printf("  Completed %d/%d generate() calls, final n_ctx=%d (started at %d, never decreased)\n",
+               calls_ok, n_calls, prev_ctx, ctx_before);
+
+        if (reuse_ok) {
+            test_pass("KV cache never shrinks across varying-length consecutive calls");
+        } else {
+            fail_count++;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 7: Summary statistics
     // -----------------------------------------------------------------------
     printf("Test %d: Summary\n", ++test_num);
     printf("  +-------------------------------------+\n");

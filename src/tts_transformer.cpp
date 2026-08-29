@@ -150,10 +150,70 @@ bool TTSTransformer::load_model(const std::string & model_path) {
     
     state_.compute_meta.resize(ggml_tensor_overhead() * QWEN3_TTS_MAX_NODES + ggml_graph_overhead());
 
+    // Pre-reserve both KV caches and the compute-graph scratch arena once,
+    // up front, while the heap is still clean -- see ADR 0005 sec 2 and
+    // issue #7. This removes the two concrete fragmentation drivers
+    // Phase 0 diagnosed: (a) the talker KV cache being torn down and
+    // rebuilt on almost every generate() call as required_ctx varies with
+    // input length (see the grow-only fix in generate() below), and
+    // (b) the compute arena being grown gradually, call by call, against
+    // an already-churned heap instead of being sized once against a clean
+    // one. Both must be covered -- fixing only one is not enough.
+    if (!init_kv_cache(QWEN3_TTS_DEFAULT_RESERVE_CTX)) {
+        return false;
+    }
+    if (!init_code_pred_kv_cache(16)) {
+        return false;
+    }
+    if (!reserve_worst_case_arena()) {
+        return false;
+    }
+
     if (!try_init_coreml_code_predictor(model_path)) {
         return false;
     }
-    
+
+    return true;
+}
+
+bool TTSTransformer::reserve_worst_case_arena() {
+    // Build a throwaway worst-case prefill graph purely to measure and
+    // reserve the compute-graph scratch arena for state_.sched once, at
+    // load time. This mirrors the documented ggml-backend usage pattern
+    // for ggml_backend_sched_reserve() (see ggml-backend.h's own doc
+    // comment). The graph is never computed -- no real data is read or
+    // written, only its shape is used to size the arena -- and it
+    // references the talker KV cache tensors, so this must run after
+    // init_kv_cache() has already sized state_.cache.
+    //
+    // The prefill graph (a batched pass over many token positions at once)
+    // is used as the worst-case anchor since it dominates the per-step
+    // decode graph (build_step_graph(), one token at a time) in practice.
+    // If a real call's graph ever turns out to need more than what's
+    // reserved here, ggml_backend_sched_alloc_graph() still grows it
+    // automatically and gracefully (every call site already checks its
+    // return value and reports a recoverable error -- see generate(),
+    // forward_prefill(), forward_step(), etc.). This reservation only
+    // removes the *gratuitous*, expected-case churn; it is not a hard
+    // ceiling.
+    const int32_t reserve_tokens = std::min<int32_t>(
+        QWEN3_TTS_RESERVE_PREFILL_TOKENS, state_.cache.n_ctx - 8);
+    if (reserve_tokens <= 0) {
+        error_msg_ = "KV cache too small to build reservation graph";
+        return false;
+    }
+
+    struct ggml_cgraph * gf = build_prefill_forward_graph(reserve_tokens, 0);
+    if (!gf) {
+        error_msg_ = "Failed to build reservation graph";
+        return false;
+    }
+
+    if (!ggml_backend_sched_reserve(state_.sched, gf)) {
+        error_msg_ = "Failed to reserve compute arena";
+        return false;
+    }
+
     return true;
 }
 
@@ -2628,8 +2688,18 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
     const int32_t prefill_len = (int32_t)(prefill_embd.size() / cfg.hidden_size);
     const int32_t trailing_len = (int32_t)(trailing_text_hidden.size() / cfg.hidden_size);
 
+    // Grow-only: the cache is pre-reserved once at load time for the
+    // expected worst case (QWEN3_TTS_DEFAULT_RESERVE_CTX, see load_model())
+    // and reused across every call. Never shrink it just because a given
+    // call's required_ctx happens to be much smaller than what's currently
+    // reserved -- that "shrink if too big" behavior used to trigger a full
+    // free+realloc of this (large) buffer on almost every call, since
+    // required_ctx tracks input text length and varies call to call. That
+    // repeated free/malloc cycling of a large buffer is the concrete
+    // fragmentation driver Phase 0 diagnosed (see ADR 0005). Only grow when
+    // a call genuinely needs more than what's already reserved.
     const int32_t required_ctx = prefill_len + max_len + 8;
-    if (state_.cache.n_ctx < required_ctx || state_.cache.n_ctx > std::max<int32_t>(required_ctx * 2, 512)) {
+    if (state_.cache.n_ctx < required_ctx) {
         if (!init_kv_cache(required_ctx)) {
             return false;
         }

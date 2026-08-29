@@ -54,6 +54,29 @@ struct tts_timing {
 
 #define QWEN3_TTS_MAX_NODES 16384
 
+// Default worst-case single-generation KV-cache context, pre-reserved once
+// at load time and reused across every generate() call thereafter (see
+// ADR 0005 sec 2 / issue #7). Sized from the product's bounded
+// local-regeneration design (a single generate() call covers one edited
+// segment, not a full recording -- docs/00 sec 4.1) and this engine's
+// validated real-material text-length range (~200-400 chars). Matches the
+// existing default `max_audio_tokens` cap (4096) used across the public
+// API, plus headroom for prefill tokens and the +8 padding `generate()`
+// already adds when sizing required_ctx.
+//
+// This is a starting point, not a hard ceiling: if a caller genuinely
+// needs more than this in a given call, the cache still grows on demand
+// (see TTSTransformer::generate()) -- pre-reserving it here only removes
+// the *gratuitous* free+realloc churn for calls within the expected
+// range, which is the concrete fragmentation driver Phase 0 diagnosed.
+#define QWEN3_TTS_DEFAULT_RESERVE_CTX 4608
+
+// Worst-case prefill token count used only to shape the one-off, load-time
+// reservation graph (see TTSTransformer::reserve_worst_case_arena()). Not a
+// hard input limit -- forward_prefill() still accepts longer inputs and
+// will grow the KV cache/arena gracefully if one ever arrives.
+#define QWEN3_TTS_RESERVE_PREFILL_TOKENS 512
+
 // TTS Transformer configuration (Qwen2-based Talker)
 struct tts_transformer_config {
     // Text embedding
@@ -267,8 +290,15 @@ public:
                   int32_t top_k = 50);
     
     const tts_transformer_config & get_config() const { return model_.config; }
-    
+
     const std::string & get_error() const { return error_msg_; }
+
+    // Test/diagnostic accessors -- expose the talker KV cache's current
+    // reserved context size so regression tests can assert the "grow-only,
+    // never gratuitously shrink" invariant (issue #7 / ADR 0005) without
+    // needing device-level memory instrumentation.
+    int32_t get_kv_cache_ctx() const { return state_.cache.n_ctx; }
+    int32_t get_code_pred_kv_cache_ctx() const { return state_.code_pred_cache.n_ctx; }
     
     // Legacy interface for compatibility
     bool forward(const int32_t * tokens, int32_t n_tokens, int32_t n_past,
@@ -280,6 +310,13 @@ public:
                             std::vector<float> & output);
     
 private:
+    // Pre-reserve the compute-graph scratch arena for state_.sched against
+    // a worst-case throwaway prefill graph, once, at load time (see ADR
+    // 0005 sec 2 / issue #7). Must be called after both KV caches have
+    // already been sized via init_kv_cache()/init_code_pred_kv_cache(),
+    // since the reservation graph references their tensors.
+    bool reserve_worst_case_arena();
+
     bool try_init_coreml_code_predictor(const std::string & model_path);
     bool predict_codes_autoregressive_coreml(const float * hidden, int32_t codebook_0_token,
                                              std::vector<int32_t> & output,
