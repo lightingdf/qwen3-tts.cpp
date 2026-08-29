@@ -183,10 +183,14 @@ private:
     struct ggml_cgraph * build_graph(int32_t n_frames);
     bool decode_single(const int32_t * codes, int32_t n_frames, int32_t position_offset,
                        std::vector<float> & samples);
-    bool is_primary_backend_cuda() const;
-    bool decode_chunked_cuda(const int32_t * codes, int32_t n_frames,
-                             std::vector<float> & samples,
-                             int32_t max_gpu_frames, int32_t context_frames_cfg);
+    // Chunked decode: splits a long utterance into overlapping segments (each
+    // decoded via decode_single) to avoid holding the whole utterance's
+    // intermediate tensors in memory at once. Backend-agnostic — originally
+    // gated to CUDA only (see decode()'s history), but nothing in this
+    // function is CUDA-specific; it just calls decode_single per chunk.
+    bool decode_chunked(const int32_t * codes, int32_t n_frames,
+                        std::vector<float> & samples,
+                        int32_t max_frames, int32_t context_frames_cfg);
     int64_t output_samples_for_frames(int32_t n_frames) const;
     
     // Apply Snake activation: x + (1/alpha) * sin^2(alpha * x)

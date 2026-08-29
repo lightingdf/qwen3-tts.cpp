@@ -196,8 +196,9 @@ At runtime, each component logs its selected backend (for example, `TTSTransform
 - Decoder now follows the same backend preference and will use Metal when available
 - `QWEN3_TTS_BACKEND` overrides runtime selection: `auto` (default), `cuda`, or `cpu`
 - `QWEN3_TTS_DEVICE` selects CUDA device index when `QWEN3_TTS_BACKEND=cuda` (default device is index 0)
-- `QWEN3_TTS_DECODER_GPU_MAX_FRAMES` controls max frames per CUDA vocoder chunk (default: `34`)
-- `QWEN3_TTS_DECODER_GPU_CONTEXT_FRAMES` controls left-context frames per CUDA vocoder chunk (default: `12`)
+- `QWEN3_TTS_DECODER_MAX_FRAMES` controls max frames per vocoder decode chunk, on any backend (CPU/Metal/CUDA) — chunked decode bounds peak memory for long utterances instead of holding the whole utterance's intermediate tensors at once (default: `64`; `0` disables chunking)
+- `QWEN3_TTS_DECODER_CONTEXT_FRAMES` controls left-context frames per vocoder decode chunk (default: `12`)
+- `QWEN3_TTS_DECODER_GPU_MAX_FRAMES` / `QWEN3_TTS_DECODER_GPU_CONTEXT_FRAMES` are deprecated aliases for the two above, kept for backward compat (from when this path was CUDA-only)
 
 ## Architecture
 

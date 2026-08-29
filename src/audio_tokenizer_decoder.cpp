@@ -35,6 +35,93 @@ static int32_t get_env_i32(const char * key, int32_t default_value) {
     return (int32_t) parsed;
 }
 
+// Reads `new_key` first; if unset, falls back to `old_key` (kept for
+// backward compat — `old_key` predates issue #9's CPU/Metal enablement,
+// when chunked decode was CUDA-only and the name still said "GPU").
+static int32_t get_env_i32_alias(const char * new_key, const char * old_key, int32_t default_value) {
+    const char * v = std::getenv(new_key);
+    if (v && *v) {
+        return get_env_i32(new_key, default_value);
+    }
+    return get_env_i32(old_key, default_value);
+}
+
+// --- Diagnostic-only: per-node memory sampling inside decode_single's graph
+// compute (issue #9 follow-up). Off by default (near-zero overhead check:
+// one env lookup + one strcmp-table lookup per node); enabled via
+// QWEN3_TTS_DECODER_STAGE_MEM=1 to answer "does the memory peak happen in
+// the pre-transformer (unbounded causal attention, small tensors at 12.5Hz)
+// or in the upsample/decoder convs (huge tensors after ~1920x upsampling)?"
+// without guessing. Never wired into the production decode path otherwise.
+#ifdef __APPLE__
+#include <mach/mach.h>
+#endif
+
+static bool stage_mem_logging_enabled() {
+    return get_env_i32("QWEN3_TTS_DECODER_STAGE_MEM", 0) != 0;
+}
+
+static void log_stage_memory(const char * label) {
+#ifdef __APPLE__
+    mach_task_basic_info_data_t basic_info = {};
+    mach_msg_type_number_t basic_count = MACH_TASK_BASIC_INFO_COUNT;
+    uint64_t rss_bytes = 0;
+    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO,
+                  reinterpret_cast<task_info_t>(&basic_info), &basic_count) == KERN_SUCCESS) {
+        rss_bytes = (uint64_t) basic_info.resident_size;
+    }
+
+    task_vm_info_data_t vm_info = {};
+    mach_msg_type_number_t vm_count = TASK_VM_INFO_COUNT;
+    uint64_t phys_bytes = rss_bytes;
+    if (task_info(mach_task_self(), TASK_VM_INFO,
+                  reinterpret_cast<task_info_t>(&vm_info), &vm_count) == KERN_SUCCESS) {
+        phys_bytes = (uint64_t) vm_info.phys_footprint;
+    }
+
+    fprintf(stderr, "  [decode-stage] %-24s rss=%.2f MB  phys=%.2f MB\n",
+            label, rss_bytes / (1024.0 * 1024.0), phys_bytes / (1024.0 * 1024.0));
+#else
+    (void) label;
+#endif
+}
+
+// Node names we set via ggml_set_name in build_graph, in the order they
+// become available during forward execution. Only these are logged (not
+// every node) to keep output readable and overhead low.
+static bool is_stage_checkpoint_name(const char * name) {
+    static const char * const kNames[] = {
+        "vq_output", "pre_conv_output", "pre_conv_reshaped", "pre_tfm_input",
+        "pre_tfm_output", "pre_tfm_reshaped", "upsample_output", "dec0_output",
+        "dec1_output", "dec2_output", "dec3_output", "dec4_output",
+        "dec5_output", "dec6_output", "audio",
+    };
+    for (const char * n : kNames) {
+        if (strcmp(name, n) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// ggml_backend_sched_eval_callback: invoked twice per node (ask=true before
+// computing it, ask=false after). During "ask" we only opt in for our named
+// checkpoints, so the scheduler keeps batching every other node into its
+// normal multi-node backend-compute calls (no per-node sync barrier except
+// right after the handful of tensors we actually care about). During
+// "observe" (ask=false) we log memory for the checkpoint that just finished.
+// Returning true always means "continue the graph compute".
+static bool stage_mem_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
+    (void) user_data;
+    if (t->name[0] == '\0' || !is_stage_checkpoint_name(t->name)) {
+        return ask ? false : true;
+    }
+    if (!ask) {
+        log_stage_memory(t->name);
+    }
+    return true;
+}
+
 AudioTokenizerDecoder::AudioTokenizerDecoder() = default;
 
 AudioTokenizerDecoder::~AudioTokenizerDecoder() {
@@ -909,13 +996,32 @@ bool AudioTokenizerDecoder::decode_single(const int32_t * codes, int32_t n_frame
     }
     
 
-    
+
+    const bool stage_mem = stage_mem_logging_enabled();
+    if (stage_mem) {
+        ggml_backend_sched_set_eval_callback(state_.sched, stage_mem_eval_callback, nullptr);
+        char label[48];
+        snprintf(label, sizeof(label), "decode/n_frames=%d/start", n_frames);
+        log_stage_memory(label);
+    }
+
     if (ggml_backend_sched_graph_compute(state_.sched, gf) != GGML_STATUS_SUCCESS) {
         error_msg_ = "Failed to compute graph";
+        if (stage_mem) {
+            ggml_backend_sched_set_eval_callback(state_.sched, nullptr, nullptr);
+        }
         ggml_backend_sched_reset(state_.sched);
         return false;
     }
-    
+
+    if (stage_mem) {
+        // Unregister so subsequent decode_single calls (e.g. later chunks)
+        // don't keep paying the per-checkpoint sync-barrier cost beyond what
+        // was requested for this diagnostic run -- re-registered fresh at
+        // the top of each decode_single call above.
+        ggml_backend_sched_set_eval_callback(state_.sched, nullptr, nullptr);
+    }
+
     struct ggml_tensor * audio_tensor = ggml_graph_get_tensor(gf, "audio");
     if (!audio_tensor) {
         error_msg_ = "Failed to find audio tensor";
@@ -932,27 +1038,24 @@ bool AudioTokenizerDecoder::decode_single(const int32_t * codes, int32_t n_frame
     return true;
 }
 
-bool AudioTokenizerDecoder::is_primary_backend_cuda() const {
-    ggml_backend_dev_t device = state_.backend ? ggml_backend_get_device(state_.backend) : nullptr;
-    if (!device) {
-        return false;
-    }
-
-    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(device);
-    const char * reg_name = reg ? ggml_backend_reg_name(reg) : nullptr;
-    return reg_name && strcmp(reg_name, "CUDA") == 0;
-}
-
-bool AudioTokenizerDecoder::decode_chunked_cuda(const int32_t * codes, int32_t n_frames,
-                                                std::vector<float> & samples,
-                                                int32_t max_gpu_frames, int32_t context_frames_cfg) {
-    // Chunked CUDA decode to avoid large IM2COL launches for long utterances.
-    const int32_t context_frames = std::min(context_frames_cfg, std::max(0, max_gpu_frames - 1));
-    const int32_t chunk_payload = std::max(1, max_gpu_frames - context_frames);
+bool AudioTokenizerDecoder::decode_chunked(const int32_t * codes, int32_t n_frames,
+                                           std::vector<float> & samples,
+                                           int32_t max_frames, int32_t context_frames_cfg) {
+    // Chunked decode to avoid holding a long utterance's full intermediate
+    // tensor set in memory at once (issue #9: on iPhone this is where the
+    // decode-stage phys_footprint peak comes from, not autoregressive
+    // generation). Backend-agnostic: this loop just calls decode_single per
+    // chunk and drops each chunk's warmup/context samples — nothing here is
+    // CUDA-specific. Originally gated to CUDA only upstream (large IM2COL
+    // launches on GPU were the original motivation); that gate is gone as of
+    // issue #9, since the same mechanism reduces the CPU/Metal decode peak
+    // just as well.
+    const int32_t context_frames = std::min(context_frames_cfg, std::max(0, max_frames - 1));
+    const int32_t chunk_payload = std::max(1, max_frames - context_frames);
 
     fprintf(stderr,
-            "  AudioTokenizerDecoder: chunked GPU decode enabled (frames=%d, chunk=%d, context=%d)\n",
-            n_frames, max_gpu_frames, context_frames);
+            "  AudioTokenizerDecoder: chunked decode enabled (frames=%d, chunk=%d, context=%d)\n",
+            n_frames, max_frames, context_frames);
 
     const auto & cfg = model_.config;
     samples.clear();
@@ -991,15 +1094,39 @@ bool AudioTokenizerDecoder::decode(const int32_t * codes, int32_t n_frames,
         return true;
     }
 
-    const int32_t max_gpu_frames = get_env_i32("QWEN3_TTS_DECODER_GPU_MAX_FRAMES", 34);
-    const int32_t context_frames_cfg = get_env_i32("QWEN3_TTS_DECODER_GPU_CONTEXT_FRAMES", 12);
+    // Chunk size / context frames, configurable via env var (issue #9: new
+    // backend-neutral names take priority; old "_GPU_" names — from when
+    // this path was CUDA-only — still work for compat). This value is never
+    // a compile-time constant to hardcode around: it must stay runtime-
+    // tunable so a future device/target can be dialed in without a rebuild.
+    //
+    // Default changed 34 -> 64 as part of issue #9's real-device curve (CPU
+    // backend, iPhone 16 Pro, baseline entitlement): unchunked decode is not
+    // an option (SIGKILL on-device before decode completes), and among the
+    // three chunk sizes measured (34/64/128, see issue #9 PR), memory is the
+    // actual constraint (it is the reason unchunked fails) while all three
+    // chunked sizes have decode-time headroom. 64 buys ~13% faster per-frame
+    // decode over 34 for only +0.13GB phys peak (2.22GB vs 2.09GB measured),
+    // both comfortably inside the product's 2.5-2.8GB target; 128's further
+    // speed gain (+28% over 34) costs proportionally more memory (+0.39GB)
+    // for a resource that's already the binding constraint, so it is not the
+    // default. Override with QWEN3_TTS_DECODER_MAX_FRAMES for any of these
+    // three (or another value) without a rebuild.
+    const int32_t max_frames = get_env_i32_alias("QWEN3_TTS_DECODER_MAX_FRAMES",
+                                                  "QWEN3_TTS_DECODER_GPU_MAX_FRAMES", 64);
+    const int32_t context_frames_cfg = get_env_i32_alias("QWEN3_TTS_DECODER_CONTEXT_FRAMES",
+                                                          "QWEN3_TTS_DECODER_GPU_CONTEXT_FRAMES", 12);
 
-    // Fast path: non-CUDA backends, or requests that fit one decode chunk.
-    if (!is_primary_backend_cuda() || max_gpu_frames <= 0 || n_frames <= max_gpu_frames) {
+    // Fast path: chunking disabled (max_frames<=0) or the whole utterance
+    // already fits in one chunk. Applies to every backend now — issue #9
+    // removed the CUDA-only gate that used to force CPU/Metal through
+    // decode_single() unconditionally regardless of n_frames, which is what
+    // caused the full-utterance decode-stage phys_footprint spike on iOS.
+    if (max_frames <= 0 || n_frames <= max_frames) {
         return decode_single(codes, n_frames, 0, samples);
     }
 
-    return decode_chunked_cuda(codes, n_frames, samples, max_gpu_frames, context_frames_cfg);
+    return decode_chunked(codes, n_frames, samples, max_frames, context_frames_cfg);
 }
 
 void free_audio_decoder_model(audio_decoder_model & model) {
